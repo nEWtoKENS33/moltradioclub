@@ -6,7 +6,7 @@ import { getRedis } from "@/lib/redis";
 const MSG_LIST = (sid: string) => `cr:session:${sid}:messages`;
 const PUB_CH = (sid: string) => `cr:session:${sid}:pub`;
 
-function sseEvent(event: string, data: string) {
+function sse(event: string, data: string) {
   return `event: ${event}\ndata: ${data}\n\n`;
 }
 
@@ -20,67 +20,94 @@ export async function GET(req: Request) {
 
   const redis = getRedis();
   const sub = redis.duplicate();
-
   const encoder = new TextEncoder();
 
   const stream = new ReadableStream<Uint8Array>({
     start: async (controller) => {
-      // 1) Send backlog
+      let closed = false;
+      let ping: any = null;
+
+      const safeEnqueue = (chunk: string) => {
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode(chunk));
+        } catch {
+          // ignore enqueue after close
+          closed = true;
+        }
+      };
+
+      const safeClose = () => {
+        if (closed) return;
+        closed = true;
+        try {
+          controller.close();
+        } catch {
+          // ignore
+        }
+      };
+
+      const cleanup = async () => {
+        if (ping) clearInterval(ping);
+        try {
+          await sub.unsubscribe(PUB_CH(sessionId));
+        } catch {}
+        try {
+          sub.disconnect();
+        } catch {}
+      };
+
+      // Close on client abort (and prevent double close)
+      req.signal.addEventListener("abort", () => {
+        void cleanup().finally(() => safeClose());
+      });
+
+      // 1) backlog
       try {
         const backlog = await redis.lrange(MSG_LIST(sessionId), -200, -1);
-        for (const item of backlog) {
-          controller.enqueue(encoder.encode(sseEvent("msg", item)));
-        }
-      } catch (e: any) {
-        controller.enqueue(
-          encoder.encode(
-            sseEvent("msg", JSON.stringify({
+        for (const item of backlog) safeEnqueue(sse("msg", item));
+      } catch {
+        safeEnqueue(
+          sse(
+            "msg",
+            JSON.stringify({
               sessionId,
               idx: -1,
               agent: "SYSTEM",
-              text: `SYSTEM: backlog read failed`,
+              text: "SYSTEM: backlog read failed",
               ts: Date.now(),
-            }))
+            })
           )
         );
       }
 
-      // 2) Subscribe to live messages
+      // 2) subscribe
       try {
-        sub.on("message", (_channel, message) => {
-          controller.enqueue(encoder.encode(sseEvent("msg", message)));
+        sub.on("message", (_ch, message) => {
+          safeEnqueue(sse("msg", message));
         });
 
         await sub.subscribe(PUB_CH(sessionId));
 
-        // 3) Heartbeat so proxies don’t kill the connection
-        const ping = setInterval(() => {
-          controller.enqueue(encoder.encode(`: ping ${Date.now()}\n\n`));
+        // heartbeat
+        ping = setInterval(() => {
+          safeEnqueue(`: ping ${Date.now()}\n\n`);
         }, 15000);
-
-        // 4) Close on client abort
-        req.signal.addEventListener("abort", async () => {
-          clearInterval(ping);
-          try {
-            await sub.unsubscribe(PUB_CH(sessionId));
-          } catch {}
-          try {
-            sub.disconnect();
-          } catch {}
-          controller.close();
-        });
-      } catch (e: any) {
-        controller.enqueue(
-          encoder.encode(
-            sseEvent("msg", JSON.stringify({
+      } catch {
+        safeEnqueue(
+          sse(
+            "msg",
+            JSON.stringify({
               sessionId,
               idx: -1,
               agent: "SYSTEM",
-              text: `SYSTEM: subscribe failed`,
+              text: "SYSTEM: subscribe failed",
               ts: Date.now(),
-            }))
+            })
           )
         );
+        await cleanup();
+        safeClose();
       }
     },
   });
@@ -90,8 +117,7 @@ export async function GET(req: Request) {
       "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
-      // CORS si lo necesitas (si todo es mismo dominio, no es necesario)
-      // "Access-Control-Allow-Origin": "*",
+      "X-Accel-Buffering": "no",
     },
   });
 }
