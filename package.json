@@ -4,9 +4,10 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "worker": "node worker.js",
     "build": "next build",
-    "start": "next start",
-    "worker": "node worker.js"
+    "start": "next start"
+    
   },
   "dependencies": {
     "ioredis": "^5.9.2",
